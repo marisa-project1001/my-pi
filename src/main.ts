@@ -1,17 +1,19 @@
 const VERSION = "0.1.0";
 import { AppConfig, loadConfig } from "./config";
-import { chatOnce, ChatOnceOptions } from "./ai/openai";
+import { chatOnce, ChatOptions, streamChat } from "./ai/openai";
 import { buildMessages } from "./messages";
 
 interface CliOptions {
     prompt: string;
     system?: string;
     showMessages: boolean;
+    stream: boolean;
 }
 
 function parseArgs(argv: string[]): CliOptions {
     let system: string | undefined;
     let showMessages = false;
+    let stream = false;
     const rest: string[] = [];
     
     for (let i = 0;i < argv.length;i++) {
@@ -24,7 +26,10 @@ function parseArgs(argv: string[]): CliOptions {
             }
         } else if (arg === "--show-messages") {
             showMessages = true;
-        } else {
+        } else if (arg === "--stream") {
+            stream = true;
+        }
+        else {
             rest.push(arg);
         }
     }
@@ -33,6 +38,7 @@ function parseArgs(argv: string[]): CliOptions {
         prompt: rest.join(" ").trim(),
         system,
         showMessages,
+        stream,
     };
 }
 
@@ -46,6 +52,7 @@ async function main(): Promise<void> {
         console.log("  npm run dev -- <prompt>");
         console.log('  npm run dev -- --system "<instruction>" <prompt>');
         console.log("  npm run dev -- --show-messages <prompt>");
+        console.log("  npm run dev -- --stream <prompt>");
         return;
     }
     
@@ -70,14 +77,25 @@ async function main(): Promise<void> {
         console.log("");
     }
     
-    const result = await chatOnce({
-      apiKey: appConfig.apiKey,
-      baseUrl: appConfig.baseUrl,
-      model: appConfig.model,
-      messages,
-    });
+    const chatOptions = {
+        apiKey: appConfig.apiKey,
+        baseUrl: appConfig.baseUrl,
+        model: appConfig.model,
+        messages,
+    }
     
-    console.log(result.text);
+    if(options.stream) {
+        for await (const event of streamChat (chatOptions)) {
+            if(event.type === "text") {
+                process.stdout.write(event.delta);
+            } else {
+                process.stdout.write("\n");
+            }
+        }
+    } else {
+        const result = await chatOnce(chatOptions);
+        console.log(result.text);
+    }
 }
 
 main().catch((error:unknown) => {

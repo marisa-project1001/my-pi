@@ -16,3 +16,5 @@ export interface ChatResult {
     model: string;
     usage?: ChatUsage;
 }
+
+export type ChatStreamEvent = {type: "text"; delta: string} | {type: "done"; text: string};

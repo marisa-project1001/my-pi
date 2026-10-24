@@ -1,6 +1,6 @@
-import type { ChatMessage, ChatResult } from "./types";
+import type { ChatMessage, ChatResult, ChatStreamEvent } from "./types";
 
-export interface ChatOnceOptions {
+export interface ChatOptions {
   apiKey: string;
   baseUrl: string;
   model: string;
@@ -34,7 +34,8 @@ interface OpenAIResponse {
   };
 } //字段全写成可选,因为外部JSON不可信,服务器可能少字段或者返回错误结构
 
-export async function chatOnce(options: ChatOnceOptions): Promise<ChatResult> {
+
+export async function chatOnce(options: ChatOptions): Promise<ChatResult> {
   const url = `${options.baseUrl}/chat/completions`;
 
   //1.发请求
@@ -97,4 +98,112 @@ export async function chatOnce(options: ChatOnceOptions): Promise<ChatResult> {
         }
       : undefined,
   };
+}
+
+interface OpenAIStreamResponse {
+    choices?: Array<{
+        delta?: {
+            content?: string | null;
+        };
+    }>;
+}//流式响应类型
+
+export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStreamEvent> {
+    const url = `${options.baseUrl}/chat/completions`;
+   
+    //1.发请求
+    let response: Response;
+
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${options.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: options.model,
+          messages: options.messages,
+          stream: true,
+        }),
+        signal: options.signal,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ChatError(`Network error while calling ${url}:${message}`);
+    }
+    
+      //2.检查HTTP状态
+    if (!response.ok) {
+      const body = await response.text();
+      const detail = body.slice(0, 500).trim();
+
+      throw new ChatError(
+       `Chat request failed: ${response.status} ${response.statusText} ${detail ? `\n${detail}` : ""}`,
+        { status: response.status, body: detail },
+      );
+    }
+    
+    if(!response.body) {
+        throw new ChatError("Chat response had no body.");
+    }
+    
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    
+    let buffer = "";
+    let fullText = "";
+    let finished = false;
+    
+    try {
+        while (!finished) {
+            const {done, value} = await reader.read();
+            if(done)
+                break;
+                
+            buffer += decoder.decode(value, {stream: true});
+            buffer = buffer.replace(/\r\n/g,"\n");//win中结尾不是\n\n而是\r\n\r\n
+            
+            while(true) {
+                const boundary = buffer.indexOf("\n\n");
+                if(boundary === -1)
+                    break;
+                    
+                const rawEvent = buffer.slice(0, boundary);
+                buffer = buffer.slice(boundary + 2);
+                
+                const dataLines = rawEvent
+                .split("\n")
+                .filter((line) => line.startsWith("data:"))
+                .map((line) => line.slice(5).trim());
+                
+                if(dataLines.length === 0) continue;
+                
+                const data = dataLines.join("\n");
+                
+                if (data === "[DONE]") {
+                    finished = true;
+                    break;
+                }
+                
+                let parsed: unknown;
+                
+                try {
+                    parsed = JSON.parse(data);
+                } catch {
+                    throw new ChatError(`Invalid SSE JSON: ${data.slice(0,200)}`);
+                }
+                
+                const delta = ((parsed as OpenAIStreamResponse).choices?.[0]?.delta?.content);
+                
+                if(typeof delta === "string" && delta.length > 0) {
+                    fullText += delta;
+                    yield { type: "text", delta};
+                }
+            }
+        }
+        yield {type:"done",text:fullText};
+    } finally {
+        reader.releaseLock();
+    }
 }
