@@ -108,6 +108,31 @@ interface OpenAIStreamResponse {
     }>;
 }//流式响应类型
 
+function readSseData(rawEvent: string): string | null {
+    const dataLines = rawEvent
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim());
+        
+    if (dataLines.length === 0) return null;
+    
+    return dataLines.join("\n");
+}//从时间块中取data
+
+function parseDelta(data: string): string | undefined {
+    let parsed: unknown;
+    
+    try {
+        parsed = JSON.parse(data);
+    } catch {
+        throw new ChatError(`Invalid SSE JSON: ${data.slice(0,200)}`);
+    }
+    
+    const delta = (parsed as OpenAIStreamResponse).choices?.[0]?.delta?.content;
+    return typeof delta === "string"? delta : undefined;
+}
+
+
 export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStreamEvent> {
     const url = `${options.baseUrl}/chat/completions`;
    
@@ -130,7 +155,13 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new ChatError(`Network error while calling ${url}:${message}`);
+      
+      yield {
+          type: "error",
+          message: `Network error while calling ${url}: ${message}`,
+          partialText: "",
+      }
+      return;
     }
     
       //2.检查HTTP状态
@@ -138,14 +169,17 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
       const body = await response.text();
       const detail = body.slice(0, 500).trim();
 
-      throw new ChatError(
-       `Chat request failed: ${response.status} ${response.statusText} ${detail ? `\n${detail}` : ""}`,
-        { status: response.status, body: detail },
-      );
+      yield {
+          type: "error",
+          message: `Chat request failed: ${response.status} ${response.statusText}${detail ? `\n${detail}` : ""}`,
+          partialText: "",
+      }
+      return;
     }
     
     if(!response.body) {
-        throw new ChatError("Chat response had no body.");
+        yield {type: "error",message: "Chat response had no body.",partialText: ""};
+        return;
     }
     
     const reader = response.body.getReader();
@@ -172,37 +206,44 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
                 const rawEvent = buffer.slice(0, boundary);
                 buffer = buffer.slice(boundary + 2);
                 
-                const dataLines = rawEvent
-                .split("\n")
-                .filter((line) => line.startsWith("data:"))
-                .map((line) => line.slice(5).trim());
+                const data = readSseData(rawEvent);
                 
-                if(dataLines.length === 0) continue;
-                
-                const data = dataLines.join("\n");
+                if(!data) continue;//挡掉没有data行和空心跳
                 
                 if (data === "[DONE]") {
                     finished = true;
                     break;
                 }
                 
-                let parsed: unknown;
+               const delta = parseDelta(data);
                 
-                try {
-                    parsed = JSON.parse(data);
-                } catch {
-                    throw new ChatError(`Invalid SSE JSON: ${data.slice(0,200)}`);
-                }
-                
-                const delta = ((parsed as OpenAIStreamResponse).choices?.[0]?.delta?.content);
-                
-                if(typeof delta === "string" && delta.length > 0) {
+                if(delta) {
                     fullText += delta;
-                    yield { type: "text", delta};
+                    yield {type: "text",delta};
                 }
             }
         }
+        
+        buffer += decoder.decode(); // EOF 冲刷：最后一个事件可能没有以 \n\n 结尾
+        
+        if(buffer.trim().length > 0) {
+            const data = readSseData(buffer);
+            
+            if(data && data !== "[DONE]") {
+                const delta = parseDelta(data);
+                
+                if (delta) {
+                    fullText += delta;
+                    yield {type: "text", delta};
+                }
+            }
+        }
+        
+        
         yield {type:"done",text:fullText};
+    } catch(error) {
+        const message = error instanceof Error ? error.message : String(error);
+        yield {type: "error",message,partialText: fullText};
     } finally {
         reader.releaseLock();
     }
