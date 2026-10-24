@@ -76,7 +76,7 @@ export async function chatOnce(options: ChatOnceOptions): Promise<ChatResult> {
   try {
     data = (await response.json()) as OpenAIResponse; //as是强制类型转换
   } catch {
-    throw new ChatError("Chat reponse was not valid JSON.");
+    throw new ChatError("Chat response was not valid JSON.");
   }
 
   //4.取文本
