@@ -20,5 +20,6 @@ export interface ChatResult {
 export type ChatStreamEvent = 
     | {type: "text"; delta: string} 
     | {type: "done"; text: string}
-    | {type: "error"; message: string; partialText: string};
+    | {type: "error"; message: string; partialText: string}
+    | {type: "aborted"; partialText: string};
     

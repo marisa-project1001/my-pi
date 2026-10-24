@@ -56,6 +56,11 @@ export async function chatOnce(options: ChatOptions): Promise<ChatResult> {
       signal: options.signal,
     });
   } catch (error) {
+      if (options.signal?.aborted) {
+        throw new ChatError("Request aborted");
+      }
+      
+      
     const message = error instanceof Error ? error.message : String(error);
     throw new ChatError(`Network error while calling ${url}:${message}`);
   }
@@ -154,8 +159,13 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
         signal: options.signal,
       });
     } catch (error) {
+      if (options.signal?.aborted) {
+          yield {type: "aborted", partialText: ""};
+          return;
+      }
+           
       const message = error instanceof Error ? error.message : String(error);
-      
+  
       yield {
           type: "error",
           message: `Network error while calling ${url}: ${message}`,
@@ -239,11 +249,20 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
             }
         }
         
+        if (options.signal?.aborted) {
+            yield { type: "aborted", partialText: fullText };
+            return;
+        }
+        
         
         yield {type:"done",text:fullText};
     } catch(error) {
-        const message = error instanceof Error ? error.message : String(error);
-        yield {type: "error",message,partialText: fullText};
+      if (options.signal?.aborted) {
+              yield {type: "aborted", partialText: fullText};
+      } else {
+            const message = error instanceof Error ? error.message : String(error);
+            yield {type: "error",message,partialText: fullText};
+        }
     } finally {
         reader.releaseLock();
     }

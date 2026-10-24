@@ -10,6 +10,12 @@ interface CliOptions {
     stream: boolean;
 }
 
+const controller = new AbortController();//创建控制器
+
+process.once("SIGINT", () => {
+    controller.abort();
+})
+
 function parseArgs(argv: string[]): CliOptions {
     let system: string | undefined;
     let showMessages = false;
@@ -82,19 +88,54 @@ async function main(): Promise<void> {
         baseUrl: appConfig.baseUrl,
         model: appConfig.model,
         messages,
+        signal: controller.signal,
     }
     
     if(options.stream) {
+        let hadError = false;
+        let wasAborted = false;
+        
         for await (const event of streamChat (chatOptions)) {
             if(event.type === "text") {
                 process.stdout.write(event.delta);
-            } else {
+            } else if (event.type === "done"){
                 process.stdout.write("\n");
+            } else if (event.type === "aborted"){
+                wasAborted = true;
+                
+                if (event.partialText.length > 0) {
+                    process.stderr.write("\n");
+                }
+                
+                process.stderr.write("Aborted.\n");
+            } else {
+                hadError = true;
+                
+                if (event.partialText.length > 0) {
+                    process.stderr.write("\n");
+                }
+                
+                process.stderr.write(`Error: ${event.message}\n`);
             }
         }
+        
+        if (wasAborted) {
+            process.exitCode = 130;
+        } else if (hadError) {
+            process.exitCode = 1;
+        }
     } else {
-        const result = await chatOnce(chatOptions);
-        console.log(result.text);
+        try {
+            const result = await chatOnce(chatOptions);
+            console.log(result.text);
+        } catch (error) {
+            if (controller.signal.aborted) {
+             process.exitCode = 130;
+             return;
+            }
+            
+            throw error;
+        }
     }
 }
 
