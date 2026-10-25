@@ -77,6 +77,45 @@ function showHistory(history: ChatMessage[]): void {
     console.log("------------------");
 }//打印对话历史
 
+interface ReplCommand {
+    help: string;
+    run: (ctx: RunContext) => boolean | void;
+}
+
+function printHelp(): void {
+    console.log("可用命令: ");
+    
+    for (const [name, command] of commands) {
+        console.log(`  ${name.padEnd(8)}${command.help}`);
+    }
+}
+
+function printStats(history: ChatMessage[]): void {
+    const chars = history.reduce((sum, message) => sum + message.content.length, 0);
+    const turns = history.filter((message) => message.role === "user").length;
+    
+    console.log(
+        `历史 ${history.length} 条 / ${turns} 轮 / ${chars} 字符（粗估 ${Math.ceil(chars / 2)} tokens）`,
+    );
+}
+
+const commands = new Map<string,ReplCommand>([
+    ["/help",{help: "显示这个列表",run: () => { printHelp();}}],
+    [
+        "/clear",
+        {
+            help: "清空对话历史,只保留system",
+            run: (ctx) => {
+                const removed = Math.max(ctx.history.length - 1,0);
+                ctx.history.length = 1;//直接截断,数组引用不变
+                console.log(`已清空 ${removed} 条历史,system 保留.`);
+            },
+        },
+    ],
+    ["/stats",{ help: "查看历史条数与长度", run: (ctx) => {printStats(ctx.history)}}],
+    ["/exit",{ help: "退出", run: () => true}],
+])
+
 
 //单轮流式对话
 async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted" | "error"> {
@@ -199,6 +238,22 @@ async function runRepl(ctx: RunContext): Promise<void> {
             }
             
             if (line.length === 0) {
+                continue;
+            }
+            
+            //斜杠命令
+            if (line.startsWith("/")) {
+                const command = commands.get(line);
+                
+                if (!command) {
+                    console.log(`未知命令: ${line}, 输入 /help 查看可用命令`);
+                    continue;
+                }
+                
+                if (command.run(ctx) === true) {
+                    break;
+                }
+                
                 continue;
             }
             
