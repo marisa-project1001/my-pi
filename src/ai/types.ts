@@ -17,9 +17,23 @@ export interface ChatResult {
     usage?: ChatUsage;
 }
 
+export interface ToolDefinition {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+}
+
+export interface ChatToolCall {
+    id: string;
+    name: string;
+    arguments: string;//故意做成string,因为这一层不认识具体工具,解析参数是工具层的事
+}
+
 export type ChatStreamEvent = 
     | {type: "text"; delta: string} 
     | {type: "done"; text: string}
     | {type: "error"; message: string; partialText: string}
-    | {type: "aborted"; partialText: string};
+    | {type: "aborted"; partialText: string}
+    | {type: "tool_calls"; calls: ChatToolCall[]};
+    
     

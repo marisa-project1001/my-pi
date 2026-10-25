@@ -3,19 +3,21 @@ import { AppConfig, loadConfig } from "./config";
 import { chatOnce, ChatOptions, streamChat } from "./ai/openai";
 import {  createHistory } from "./messages";
 import * as readline from "node:readline/promises";
-import { ChatMessage } from "./ai/types";
+import { ChatMessage, ToolDefinition } from "./ai/types";
 
 interface CliOptions {
     prompt: string;
     system?: string;
     showMessages: boolean;
     stream: boolean;
+    tools:boolean;
 }
 
 interface RunContext {
     config: AppConfig;
     history: ChatMessage[];
     showMessages: boolean;
+    tools: ToolDefinition[];
 }
 
 let currentController: AbortController | null = null;
@@ -34,13 +36,26 @@ process.on("SIGINT",()=>{
     }
     
     process.exit(130);
-});
+});//监听ctrl+C
+
+const ECHO_TOOL: ToolDefinition = {
+    name: "echo",
+    description: "把输入的文本原样返回,用来验证工具调用策略",
+    parameters: {
+        type: "object",
+        properties: {
+            text: {type: "string", description: "要回显的文本"},
+        },
+        required: ["text"],
+    }
+}
 
 
 function parseArgs(argv: string[]): CliOptions {
     let system: string | undefined;
     let showMessages = false;
     let stream = false;
+    let tools = false;
     const rest: string[] = [];
     
     for (let i = 0;i < argv.length;i++) {
@@ -55,8 +70,9 @@ function parseArgs(argv: string[]): CliOptions {
             showMessages = true;
         } else if (arg === "--stream") {
             stream = true;
-        }
-        else {
+        } else if (arg === "--tools") {
+            tools = true;
+        } else {
             rest.push(arg);
         }
     }
@@ -66,6 +82,7 @@ function parseArgs(argv: string[]): CliOptions {
         system,
         showMessages,
         stream,
+        tools,
     };
 }//解析终端参数
 
@@ -134,12 +151,14 @@ async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted"
               baseUrl: ctx.config.baseUrl,
               model: ctx.config.model,  
               messages: [...ctx.history],
+              tools: ctx.tools,
               signal: controller.signal,
         };
     
         let finalText = "";
         let ok = false;
         let aborted = false;
+        let hadToolCalls = false;
         
         for await (const event of streamChat(chatOptions)) {
             if (event.type === "text") {
@@ -148,6 +167,17 @@ async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted"
                 finalText = event.text;
                 ok = true;
                 process.stdout.write("\n");
+            } else if (event.type === "tool_calls") {
+                hadToolCalls = true;
+                
+                console.log("\n[tool] 模型请求调用:");
+                
+                for (const call of event.calls) {
+                    console.log(`  ${call.name} id=${call.id}`);
+                    console.log(`  arguments = ${call.arguments}`);
+                }
+                
+                console.log("[tool] 调用结束");
             } else if (event.type === "aborted") {
                 aborted = true;
                 
@@ -165,8 +195,13 @@ async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted"
             }
         }
         
-        if(ok) {
+        if(ok && !hadToolCalls) {
             ctx.history.push({role: "assistant", content: finalText});
+            return "ok";
+        }
+        
+        if (ok && hadToolCalls) {
+            ctx.history.pop();
             return "ok";
         }
         
@@ -296,6 +331,7 @@ async function main(): Promise<void> {
         config: appConfig,
         history,
         showMessages: options.showMessages,
+        tools: options.tools ? [ECHO_TOOL] : [],
     };
 
     if(!options.prompt) {

@@ -1,10 +1,11 @@
-import type { ChatMessage, ChatResult, ChatStreamEvent } from "./types";
+import type { ChatMessage, ChatResult, ChatStreamEvent, ChatToolCall, ToolDefinition,  } from "./types";
 
 export interface ChatOptions {
   apiKey: string;
   baseUrl: string;
   model: string;
   messages: ChatMessage[];
+  tools?: ToolDefinition[];
   signal?: AbortSignal;
 } //重新定义interface,使得AI层不依赖配置层
 
@@ -105,11 +106,24 @@ export async function chatOnce(options: ChatOptions): Promise<ChatResult> {
   };
 }
 
+interface ToolCallDelta {
+    index?: number;
+    id?: string;
+    type?: string;
+    function?: {
+        name?: string;
+        arguments?: string;
+    };
+}
+
+interface StreamDelta {
+    content?: string | null;
+    tool_calls?: ToolCallDelta[];
+}
+
 interface OpenAIStreamResponse {
     choices?: Array<{
-        delta?: {
-            content?: string | null;
-        };
+        delta?: StreamDelta;
     }>;
 }//流式响应类型
 
@@ -124,7 +138,7 @@ function readSseData(rawEvent: string): string | null {
     return dataLines.join("\n");
 }//从时间块中取data
 
-function parseDelta(data: string): string | undefined {
+function parseDelta(data: string): StreamDelta {
     let parsed: unknown;
     
     try {
@@ -133,9 +147,37 @@ function parseDelta(data: string): string | undefined {
         throw new ChatError(`Invalid SSE JSON: ${data.slice(0,200)}`);
     }
     
-    const delta = (parsed as OpenAIStreamResponse).choices?.[0]?.delta?.content;
-    return typeof delta === "string"? delta : undefined;
+    return (parsed as OpenAIStreamResponse).choices?.[0]?.delta ?? {};
 }
+
+function applyDelta(delta: StreamDelta, pendingCalls: Map<number, {id: string; name: string; args: string }>): string {
+    for (const piece of delta.tool_calls ?? []) {
+        const index = piece.index ?? 0;
+        const slot = pendingCalls.get(index) ?? {id: "", name: "", args: ""};
+        
+        if (piece.id)
+            slot.id = piece.id;
+        if (piece.function?.name)
+            slot.name = piece.function.name;
+        if (piece.function?.arguments)
+            slot.args += piece.function.arguments;
+        
+        pendingCalls.set(index, slot);
+    }
+    
+    return typeof delta.content === "string" ? delta.content : "";
+}
+
+function toWireTools(tools: ToolDefinition[]) {
+    return tools.map((tool) => ({
+        type: "function",
+        function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+        },
+    }));
+}//把我们自己的tooldefinition转化为openai格式
 
 
 export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStreamEvent> {
@@ -155,6 +197,7 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
           model: options.model,
           messages: options.messages,
           stream: true,
+          ...(options.tools && options.tools.length > 0 ? { tools: toWireTools(options.tools)} : {}),
         }),
         signal: options.signal,
       });
@@ -199,6 +242,8 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
     let fullText = "";
     let finished = false;
     
+    const pendingCalls = new Map<number, { id: string; name: string; args: string;}>();
+    
     try {
         while (!finished) {
             const {done, value} = await reader.read();
@@ -225,11 +270,11 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
                     break;
                 }
                 
-               const delta = parseDelta(data);
+               const text = applyDelta(parseDelta(data), pendingCalls);
                 
-                if(delta) {
-                    fullText += delta;
-                    yield {type: "text",delta};
+                if(text.length > 0) {
+                    fullText += text;
+                    yield {type: "text",delta: text};
                 }
             }
         }
@@ -240,13 +285,26 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
             const data = readSseData(buffer);
             
             if(data && data !== "[DONE]") {
-                const delta = parseDelta(data);
+                const text = applyDelta(parseDelta(data), pendingCalls);
                 
-                if (delta) {
-                    fullText += delta;
-                    yield {type: "text", delta};
+                if (text.length > 0) {
+                    fullText += text;
+                    yield {type: "text", delta: text};
                 }
             }
+        }
+        
+        //工具调用type返回
+        if (pendingCalls.size > 0) {
+            const calls: ChatToolCall[] = [...pendingCalls.entries()]
+            .sort((a, b) => a[0] - b[0])//按工具调用的index排序
+            .map(([index, slot]) => ({
+                id: slot.id || `call_${index}`,
+                name: slot.name,
+                arguments: slot.args,
+            }));
+    
+            yield { type: "tool_calls", calls };
         }
         
         if (options.signal?.aborted) {
