@@ -1,8 +1,10 @@
-export type ChatRole = "system" | "user" | "assistant";
+export type ChatRole = "system" | "user" | "assistant" | "tool";
 
 export interface ChatMessage {
     role: ChatRole;
     content: string;
+    tool_calls?: ChatToolCall[];//assistant: 它想调用什么
+    tool_call_id?: string;// tool: 这条结果对应哪次调用
 }
 
 export interface ChatUsage {

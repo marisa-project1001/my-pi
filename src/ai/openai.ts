@@ -35,6 +35,44 @@ interface OpenAIResponse {
   };
 } //字段全写成可选,因为外部JSON不可信,服务器可能少字段或者返回错误结构
 
+function toWireMessages(messages: ChatMessage[]) {
+    return messages.map((message) => {
+        if (message.role === "assistant" && message.tool_calls && message.tool_calls.length > 0) {
+            return {
+                role: "assistant",
+                content: message.content.length > 0 ? message.content : null,
+                tool_calls: message.tool_calls.map((call) => ({
+                    id: call.id,
+                    type: "function",
+                    function: {name: call.name, arguments: call.arguments},
+                })),
+            };
+        }
+        
+        if (message.role === "tool") {
+            return {
+                role: "tool",
+                tool_call_id: message.tool_call_id,
+                content: message.content,
+            }
+        }
+        
+        return { role: message.role, content: message.content };
+    })
+}
+
+
+function toWireTools(tools: ToolDefinition[]) {
+    return tools.map((tool) => ({
+        type: "function",
+        function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+        },
+    }));
+}//把我们自己的tooldefinition转化为openai格式
+
 
 export async function chatOnce(options: ChatOptions): Promise<ChatResult> {
   const url = `${options.baseUrl}/chat/completions`;
@@ -51,7 +89,7 @@ export async function chatOnce(options: ChatOptions): Promise<ChatResult> {
       },
       body: JSON.stringify({
         model: options.model,
-        messages: options.messages,
+        messages: toWireMessages(options.messages),
         stream: false,
       }),
       signal: options.signal,
@@ -168,17 +206,6 @@ function applyDelta(delta: StreamDelta, pendingCalls: Map<number, {id: string; n
     return typeof delta.content === "string" ? delta.content : "";
 }
 
-function toWireTools(tools: ToolDefinition[]) {
-    return tools.map((tool) => ({
-        type: "function",
-        function: {
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters,
-        },
-    }));
-}//把我们自己的tooldefinition转化为openai格式
-
 
 export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStreamEvent> {
     const url = `${options.baseUrl}/chat/completions`;
@@ -195,7 +222,7 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
         },
         body: JSON.stringify({
           model: options.model,
-          messages: options.messages,
+          messages: toWireMessages(options.messages),
           stream: true,
           ...(options.tools && options.tools.length > 0 ? { tools: toWireTools(options.tools)} : {}),
         }),
