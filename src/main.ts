@@ -186,55 +186,52 @@ function preview(text: string): string {
 }//预览文本
 
 //单轮流式对话
+
+const MAX_TOOL_ROUNDS = 8;//一轮最多8次工具循环
 async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted" | "error"> {
+    const turnStart = ctx.history.length;
+    
     ctx.history.push({role: "user", content: input});
     
     if (ctx.showMessages) {
         showHistory(ctx.history);
     }
     
-    const first = await requestOnce(ctx);
+    for (let round = 1; round <= MAX_TOOL_ROUNDS ; round++ ) {
+        const result = await requestOnce(ctx);
+        
+        if (result.aborted) {
+            // 这一轮还没产生任何工具结果：撤干净；已经做过事：保留事实
+            if (ctx.history.length === turnStart + 1) {
+                ctx.history.length = turnStart;//截断
+            }
+            return "aborted";
+        }
+        
+        if (result.error) {
+            if (ctx.history.length === turnStart + 1) {
+                ctx.history.length = turnStart;//截断
+            }
+            return "error";
+        }
+        
+        // 模型不再要工具：这一轮结束
+        if (result.calls.length === 0) {
+            ctx.history.push({role: "assistant", content:result.text});
+            return "ok";
+        }
+        
+        // 要工具：assistant 带着 tool_calls 入账，再逐个执行
+        ctx.history.push({role: "assistant", content: result.text, tool_calls: result.calls});
+        
+        for (const call of result.calls) {
+            const output = await runTool(call.name, call.arguments);
+            console.log(`[tool] #${round} ${call.name}(${call.arguments}) -> ${preview(output)}`);
+            ctx.history.push({role: "tool", tool_call_id: call.id, content: output});
+        }
+    } 
     
-    if (first.aborted) {
-        ctx.history.pop();
-        return "aborted";
-    }
-    
-    if (first.error) {
-        ctx.history.pop();
-        return "error";
-    }
-    
-    if (first.calls.length === 0) {
-        ctx.history.push({role: "assistant", content: first.text});
-        return "ok";
-    }
-    
-    ctx.history.push({role: "assistant",content: first.text, tool_calls: first.calls});
-    
-    for (const call of first.calls) {
-        const result = await runTool(call.name, call.arguments);
-        console.log(`[tool] ${call.name}(${call.arguments}) -> ${preview(result)}`);
-        ctx.history.push({role: "tool", tool_call_id: call.id, content: result});
-    }
-    
-    const second = await requestOnce(ctx);
-    
-    if (second.aborted) {
-        return "aborted";
-    }
-    
-    if (second.error) {
-        return "error";
-    }
-    
-    if (second.calls.length > 0) {
-        console.log(`[tool]模型还想调用`);
-        return "ok";
-    }
-    
-    ctx.history.push({role: "assistant", content: second.text});
-    
+    console.log(`[tool] 连续 ${MAX_TOOL_ROUNDS} 轮都在请求工具，已停止。可以继续追问，或 /clear 重开。`);
     return "ok";
 }
 
