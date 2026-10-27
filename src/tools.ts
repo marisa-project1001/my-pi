@@ -1,5 +1,6 @@
-import { readFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+
+import { readFile, mkdir, stat, writeFile } from "node:fs/promises";
+import { isAbsolute, relative, resolve, dirname } from "node:path";
 import type { ToolDefinition } from "./ai/types";
 
 export interface Tool {
@@ -14,8 +15,9 @@ interface ObjectSchema {
     required?: string[];
 }
 
-const MAX_CHARS = 20000;// 给个上限防止撑爆上下文
+const MAX_CHARS = 200000;// 给个上限防止撑爆上下文
 const TOOL_TIMEOUT_MS = Number(process.env.PI_TOOL_TIMEOUT_MS ?? 15000);//工具调用超时
+const MAX_WRITE_CHARS = 200000;/// 防止模型一次灌进超大内容
 
 function insideWorkspace(input: string): string {
     const root = process.cwd();
@@ -94,7 +96,7 @@ function hintFor(reason: string, definition: ToolDefinition): string {
     if (reason.includes("ENOENT")) return "文件不存在：检查路径拼写，路径必须相对当前工作目录且在目录内。";
     if (reason.includes("EACCES")) return "没有读取权限。";
     if (reason.includes("EISDIR")) return "这是一个目录，read 只能读文件。";
-    if (reason.includes("路径越界")) return "只能读工作目录内的文件，去掉 ../ 或改用相对路径。";
+    if (reason.includes("路径越界")) return "只能访问工作目录内的文件，去掉 ../ 或改用相对路径。";
     if (reason.includes("执行超过")) return "缩小工作量或换个参数再试。";
     return `正确调用形状：${definition.name}(${exampleArgs(definition)})`;
 }
@@ -171,9 +173,165 @@ export const SLOW_TOOL: Tool = {
     },
 }
 
+export const WRITE_TOOL: Tool = {
+    definition: {
+        name: "write",
+        description: "把内容写入工作目录内的文件,不存在则构建,存在则覆盖原文件,注意是覆盖!!",
+        parameters: {
+            type: "object",
+            properties: {
+                path: {type: "string",description: "相对工作目录的文件地址,如notes/todo.md"},
+                content: {type: "string", description: "要写入的完整内容(UTF-8)"},
+            },
+            required: ["path","content"],
+        },
+    },
+    
+    async run(args) {
+        const path = args.path;
+        const content = args.content;
+        
+        if (typeof path !== "string" || path.length === 0) {
+            throw new Error("缺少参数 path");
+        }
+        
+        if (typeof content !== "string") {
+            throw new Error("缺少参数 content");
+        }
+        
+        if (content.length > MAX_WRITE_CHARS) {
+            throw new Error(`内容过长: ${content.length} 字符, 上限为 ${MAX_WRITE_CHARS} 字符`);
+        }
+        
+        const full = insideWorkspace(path);
+        
+        //先看原文件有没有内容
+        let existed = false;
+        let previousBytes = 0;
+        
+        try {
+            previousBytes = (await stat(full)).size;
+            existed = true;
+        } catch {
+            //文件不存在,走新建
+        }
+        
+        await mkdir(dirname(full), { recursive: true});
+        await writeFile(full, content, "utf8");
+        
+        const lines = content.split("\n").length;
+        const bytes = Buffer.byteLength(content, "utf8");
+        const action = existed ? `覆盖(原 ${previousBytes} 字节 -> 新 ${bytes} 字节)` : "新建";
+        
+        return `已写入 ${path}: ${action}, ${content.length} 字符  / ${lines} 行 / ${bytes} 字节`;
+    }
+}
+
+function makeDiff(before: string,  after: string, context = 2): string {
+    const a = before.split("\n");
+    const b = after.split("\n");
+    
+    let start = 0;
+    
+    while(start < a.length && start < b.length && a[start] === b[start])
+        start++;
+        
+    let endA = a.length - 1;
+    let endB = b.length - 1;
+    
+    while(endA >= start && endB >= start && a[endA] === b[endB]) {
+        endA--;
+        endB--;
+    }
+    
+    const out: string[] = [];
+    const from = Math.max(0, start - context);
+    
+    for (let i = from; i < start;++i)
+        out.push(" " + a[i]);
+    for (let i = start; i <= endA;++i)
+        out.push("-" + a[i]);
+    for (let i = start;i <= endB;++i)
+        out.push("+" +b[i]);
+        
+    const to = Math.min(b.length - 1, endB + context);
+    for (let i = endB + 1;i <= to; ++i) {
+        if (b[i] === "" && i === b.length - 1)//末尾空行不做上下文
+            break;
+        out.push(" " + b[i]);
+    }
+        
+    return `@@ 第 ${start + 1} 行 @@\n` + out.join("\n");       
+}
+
+export const EDIT_TOOL: Tool = {
+    definition: {
+        name: "edit",
+        description: "把文件里的一段原文替换为新文本;oldText必须在文件中恰好出现一次,否则拒绝",
+        parameters: {
+            type: "object",
+            properties: {
+                path: { type: "string", description: "相对工作目录的文件路径"},
+                oldText: { type: "string", description: "要被替换的原文(必须唯一,建议带上下文)"},
+                newText: {type: "string", descrription: "替换成的新文本;传空文本表示删除这段"},
+            },
+            required: ["path", "oldText", "newText"],
+        },
+    },
+    
+    async run(args) {
+        const path = args.path;
+        const oldText = args.oldText;
+        const newText = args.newText;
+        
+        if (typeof path !== "string" || path.length === 0)
+            throw new Error("path为空!");
+        if (typeof oldText !== "string" || oldText.length === 0)
+            throw new Error("缺少参数oldText(不能为空)");
+        if (typeof newText !== "string")
+            throw new Error("缺少参数 newText");
+            
+        const full = insideWorkspace(path);
+        const raw = await readFile(full, "utf8");
+        
+        if (raw.length > MAX_WRITE_CHARS) {
+            throw new Error(`文件过大(${raw.length} 字符), edit 只适合改小文件`);
+        }
+        
+        const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+        const before = raw.replace(/\r\n/g,"\n");
+        const needle = oldText.replace(/\r\n/g, "\n");
+        const replacement = newText.replace(/\r\n/g, "\n");
+        
+        const first = before.indexOf(needle);
+        const second = first === -1 ? -1 : before.indexOf(needle, first + 1);//唯一性确认
+        
+        if (first === -1) {
+            return formatError("edit", "没有找到 oldText", `文件共 ${before.split("\n").length} 行,先用 read 看清原文（空白与缩进也要一致）再改.`)
+        }
+        
+        if (second !== -1) {
+            const count = before.split(needle).length - 1;
+            return formatError("edit", `oldText在原文中出现了 ${count} 次,无法确定修改位置`, "多带几行上下文,让它在整个文件里唯一.");
+        } 
+        
+        const afterLf = before.slice(0, first) + replacement + before.slice(first + needle.length);
+        
+        const after = eol === "\r\n" ? afterLf.replace(/\n/g, "\r\n") : afterLf;
+        
+        await writeFile(full, after, "utf8");
+        
+        const lineNo = before.slice(0, first).split("\n").length;
+        const removed = needle.split("\n").length;
+        const added = replacement.split("\n").length;
+        
+        return `已编辑 ${path}: 第 ${lineNo} 行, - ${removed} 行 / + ${added} 行\n` + makeDiff(before, afterLf);
+    }
+}
+
 
 //工具在这里注册,不会再有第二个工具信息副本,方便维护
-export const TOOLS: Tool[] = [READ_TOOL, ECHO_TOOL, SLOW_TOOL];
+export const TOOLS: Tool[] = [READ_TOOL, ECHO_TOOL, SLOW_TOOL, WRITE_TOOL, EDIT_TOOL];
 export const TOOL_DEFINITIONS: ToolDefinition[] = TOOLS.map((item) => (item.definition)); 
 
 
