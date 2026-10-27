@@ -1,5 +1,12 @@
 import type { ChatMessage, ChatResult, ChatStreamEvent, ChatToolCall, ToolDefinition,  } from "./types";
 
+/*
+ChatOptions包含对话信息,会在每轮对话时传入Chat函数
+messages包含了若干条历史对话信息
+tools代表该轮要调用的工具
+signal控制中断
+*/
+
 export interface ChatOptions {
   apiKey: string;
   baseUrl: string;
@@ -9,6 +16,9 @@ export interface ChatOptions {
   signal?: AbortSignal;
 } //重新定义interface,使得AI层不依赖配置层
 
+/* 
+ChatError继承至Error类,用于非流式对话中的错误
+*/
 export class ChatError extends Error {
   readonly status?: number;
   readonly body?: string;
@@ -20,6 +30,10 @@ export class ChatError extends Error {
     this.body = options?.body;
   }
 }
+
+/*
+OpenAIResponse基于openai 的api协议设计
+*/
 
 interface OpenAIResponse {
   model?: string;
@@ -34,6 +48,11 @@ interface OpenAIResponse {
     total_tokens?: number;
   };
 } //字段全写成可选,因为外部JSON不可信,服务器可能少字段或者返回错误结构
+
+
+/*
+toWire函数用于将本地的信息适配为openai的格式
+*/
 
 function toWireMessages(messages: ChatMessage[]) {
     return messages.map((message) => {
@@ -71,9 +90,9 @@ function toWireTools(tools: ToolDefinition[]) {
             parameters: tool.parameters,
         },
     }));
-}//把我们自己的tooldefinition转化为openai格式
+}
 
-
+//非流式对话
 export async function chatOnce(options: ChatOptions): Promise<ChatResult> {
   const url = `${options.baseUrl}/chat/completions`;
 
@@ -144,6 +163,11 @@ export async function chatOnce(options: ChatOptions): Promise<ChatResult> {
   };
 }
 
+/*
+Delta是在流式传输中, 本地每次接收到的信息增量
+*/
+
+
 interface ToolCallDelta {
     index?: number;
     id?: string;
@@ -165,6 +189,11 @@ interface OpenAIStreamResponse {
     }>;
 }//流式响应类型
 
+
+
+/*
+基于Sse协议从时间块中提取data
+*/
 function readSseData(rawEvent: string): string | null {
     const dataLines = rawEvent
         .split("\n")
@@ -174,8 +203,11 @@ function readSseData(rawEvent: string): string | null {
     if (dataLines.length === 0) return null;
     
     return dataLines.join("\n");
-}//从时间块中取data
+}
 
+/*
+从data中解析出Delta
+*/
 function parseDelta(data: string): StreamDelta {
     let parsed: unknown;
     
@@ -188,6 +220,9 @@ function parseDelta(data: string): StreamDelta {
     return (parsed as OpenAIStreamResponse).choices?.[0]?.delta ?? {};
 }
 
+/*
+将Delta拼在对于id的ToolCall上,由于一轮对话text流只有一个,所以不需要根据id分配
+*/
 function applyDelta(delta: StreamDelta, pendingCalls: Map<number, {id: string; name: string; args: string }>): string {
     for (const piece of delta.tool_calls ?? []) {
         const index = piece.index ?? 0;
@@ -206,7 +241,9 @@ function applyDelta(delta: StreamDelta, pendingCalls: Map<number, {id: string; n
     return typeof delta.content === "string" ? delta.content : "";
 }
 
-
+/*
+一个流式输出函数,会不断对外产出(yield)信息
+*/
 export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStreamEvent> {
     const url = `${options.baseUrl}/chat/completions`;
    

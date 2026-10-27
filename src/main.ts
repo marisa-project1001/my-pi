@@ -6,6 +6,11 @@ import * as readline from "node:readline/promises";
 import { ChatMessage, ChatToolCall, ToolDefinition } from "./ai/types";
 import { TOOL_DEFINITIONS, runTool } from "./tools";
 
+
+/*
+    CliOptions装载Cli命令的解析信息
+*/
+
 interface CliOptions {
     prompt: string;
     system?: string;
@@ -14,6 +19,9 @@ interface CliOptions {
     tools:boolean;
 }
 
+/*
+    RunContext(ctx)包含所有运行信息
+*/
 interface RunContext {
     config: AppConfig;
     history: ChatMessage[];
@@ -24,6 +32,8 @@ interface RunContext {
 let currentController: AbortController | null = null;
 let exitFromIdle: (()=>void) | null = null;//空闲时怎么退出
 
+
+//监听Ctrl+C
 process.on("SIGINT",()=>{
     if (currentController) {
         currentController.abort();
@@ -37,8 +47,11 @@ process.on("SIGINT",()=>{
     }
     
     process.exit(130);
-});//监听ctrl+C
+});
 
+
+
+//解析Cli命令
 function parseArgs(argv: string[]): CliOptions {
     let system: string | undefined;
     let showMessages = false;
@@ -72,16 +85,18 @@ function parseArgs(argv: string[]): CliOptions {
         stream,
         tools,
     };
-}//解析终端参数
+}
 
+//打印对话历史
 function showHistory(history: ChatMessage[]): void {
     console.log("--- messages ---");
     for (const message of history) {
         console.log(`[${message.role}] ${message.content}`);
     };
     console.log("------------------");
-}//打印对话历史
+}
 
+//REPL的命令系统
 interface ReplCommand {
     help: string;
     run: (ctx: RunContext) => boolean | void;
@@ -120,7 +135,12 @@ const commands = new Map<string,ReplCommand>([
     ["/stats",{ help: "查看历史条数与长度", run: (ctx) => {printStats(ctx.history)}}],
     ["/exit",{ help: "退出", run: () => true}],
 ])
+//以上为REPL命令系统
 
+
+/*
+    TurnResult装载单次请求的返回信息
+*/
 interface TurnResult {
     text: string;
     calls: ChatToolCall[];
@@ -128,6 +148,7 @@ interface TurnResult {
     error: boolean;
 }
 
+//单次请求
 async function requestOnce(ctx: RunContext): Promise<TurnResult> {
     const controller = new AbortController();
     currentController = controller;
@@ -173,8 +194,8 @@ async function requestOnce(ctx: RunContext): Promise<TurnResult> {
                 process.stderr.write(`Error: ${event.message}\n`);
             }
         }
-        
-        return {text, calls ,aborted, error };
+
+        return {text, calls, aborted, error };
     } finally {
         currentController = null;
     }
@@ -186,7 +207,6 @@ function preview(text: string): string {
 }//预览文本
 
 //单轮流式对话
-
 const MAX_TOOL_ROUNDS = 8;//一轮最多8次工具循环
 async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted" | "error"> {
     const turnStart = ctx.history.length;
@@ -272,7 +292,6 @@ async function runOnce(ctx: RunContext, prompt: string): Promise<void> {
 }    
 
 //最小REPL
-
 async function runRepl(ctx: RunContext): Promise<void> { 
     const rl = readline.createInterface({
         input: process.stdin,

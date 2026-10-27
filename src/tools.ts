@@ -171,13 +171,15 @@ export const SLOW_TOOL: Tool = {
     },
 }
 
-export const TOOLS: Tool[] = [READ_TOOL, ECHO_TOOL, SLOW_TOOL];
 
+//工具在这里注册,不会再有第二个工具信息副本,方便维护
+export const TOOLS: Tool[] = [READ_TOOL, ECHO_TOOL, SLOW_TOOL];
 export const TOOL_DEFINITIONS: ToolDefinition[] = TOOLS.map((item) => (item.definition)); 
 
 
-/*执行工具调用永远返回字符串*/
-
+/*
+执行工具调用永远返回字符串,直接输回模型
+*/
 export async function runTool(name: string, rawArguments: string): Promise<string> {
     const tool = TOOLS.find((item) => item.definition.name === name);
     

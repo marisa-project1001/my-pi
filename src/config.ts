@@ -16,6 +16,12 @@ import { resolve } from "node:path";
 
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 
+
+/*
+ AppConfig是外部总配置,负责一次对话的总配置
+*/
+
+
 export function loadConfig(): AppConfig {
     const envPath = resolve(process.cwd(),".env");//resolve将括号内的路径片段解析为绝对路径,process.cwd是node的当前的工作目录
     if(existsSync(envPath)) {
