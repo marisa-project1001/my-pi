@@ -1,10 +1,12 @@
-
+import { spawn } from "node:child_process";
 import { readFile, mkdir, stat, writeFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve, dirname } from "node:path";
+import { isAbsolute, relative, resolve, dirname, join } from "node:path";
 import type { ToolDefinition } from "./ai/types";
+import { existsSync } from "node:fs";
 
 export interface Tool {
     definition: ToolDefinition;
+    timeoutMs?: number;
     run: (args: Record<string, unknown>) => Promise<string>;
 }
 
@@ -18,6 +20,44 @@ interface ObjectSchema {
 const MAX_CHARS = 200000;// 给个上限防止撑爆上下文
 const TOOL_TIMEOUT_MS = Number(process.env.PI_TOOL_TIMEOUT_MS ?? 15000);//工具调用超时
 const MAX_WRITE_CHARS = 200000;/// 防止模型一次灌进超大内容
+const BASH_TIMEOUT_MS = Number(process.env.PI_BASH_TIMEOUT_MS ?? 30000);
+const MAX_OUTPUT_CHARS = 30000;
+
+// 不要依赖 PATH 里的裸名字：Windows 上 `bash` 可能是 WSL 的应用执行别名，
+// 隐藏窗口里 spawn 会直接 EACCES（errno -4092），跟命令内容无关
+function resolveShell(): string {
+    if (process.env.PI_SHELL) {
+        if (!existsSync(process.env.PI_SHELL)) {
+            console.warn(`[warn] PI_SHELL 指向不存在的文件：${process.env.PI_SHELL}`);
+        }
+        return process.env.PI_SHELL;
+    }
+
+    if (process.platform !== "win32") return "/bin/sh";
+
+    const candidates = [
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+        "D:\\soft\\Git\\bin\\bash.exe",
+        process.env.LOCALAPPDATA + "\\Programs\\Git\\bin\\bash.exe",
+    ];
+
+    for (const candidate of candidates) {
+        if (candidate && existsSync(candidate)) return candidate;
+    }
+
+    // 再扫一遍 PATH，但跳过 WindowsApps（那里的 bash 是 WSL 应用别名，spawn 必 EACCES）
+    for (const dir of (process.env.PATH ?? "").split(";")) {
+        if (!dir || /WindowsApps/i.test(dir)) continue;
+        const p = join(dir, "bash.exe");
+        if (existsSync(p)) return p;
+    }
+
+    console.warn(`[warn] 没找到 Git bash，退回到 ${process.env.ComSpec}：中文可能乱码、ls/grep 不可用`);
+    return process.env.ComSpec ?? "cmd.exe";
+}
+
+const SHELL = resolveShell();
 
 function insideWorkspace(input: string): string {
     const root = process.cwd();
@@ -273,7 +313,7 @@ export const EDIT_TOOL: Tool = {
             properties: {
                 path: { type: "string", description: "相对工作目录的文件路径"},
                 oldText: { type: "string", description: "要被替换的原文(必须唯一,建议带上下文)"},
-                newText: {type: "string", descrription: "替换成的新文本;传空文本表示删除这段"},
+                newText: {type: "string", description: "替换成的新文本;传空文本表示删除这段"},
             },
             required: ["path", "oldText", "newText"],
         },
@@ -329,9 +369,125 @@ export const EDIT_TOOL: Tool = {
     }
 }
 
+//递归删除进程树
+function killTree(pid: number | undefined): void {
+    if(!pid)
+        return;
+        
+    if (process.platform === "win32") {
+        const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+            windowsHide: true,
+            stdio: "ignore",
+            detached: true,
+        });
+        killer.on("error", () => {});
+        killer.unref();
+        return;
+    }
+    
+    try {
+        process.kill(-pid, "SIGKILL");
+    } catch {
+
+    }
+}
+
+export const BASH_TOOL: Tool = {
+    definition: {
+        name: "bash",
+        description: "在工作目录下执行一条 shell 命令, 返回合并后的输出与退出码.会真实修改文件系统，执行前先想清楚.",
+        parameters: {
+            type: "object",
+            properties: {
+                command: {type: "string", description: "要执行的命令,如ls -la src"},
+                timeoutMs: {type: "number", description: "可选,超时毫秒数,默认 30000, 上限 120000" },
+            },
+            required: ["command"],
+        },
+    },
+    
+    timeoutMs: BASH_TIMEOUT_MS + 5000,
+        
+    async run(args) {
+        const command = args.command;
+        
+        if (typeof command !== "string" || command.trim().length === 0) {
+            throw new Error("缺少参数 command");
+        }
+        
+        const timeoutMs = Math.min(Number(args.timeoutMs ?? BASH_TIMEOUT_MS), 120000);
+        
+        
+        return await new Promise<string>((resolve) => {
+            const child = spawn(command, {
+                shell: SHELL,
+                cwd: process.cwd(),
+                windowsHide: true,
+                detached: process.platform !== "win32", // POSIX 下按进程组杀
+            });
+            
+            let output = "";
+            let truncated = false;
+            let timedOut = false;
+            let done = false;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            
+            const append = (chunk: Buffer): void => {
+                if (truncated) 
+                    return;
+                output += chunk.toString("utf8");
+                if (output.length > MAX_OUTPUT_CHARS) {
+                    output = output.slice(0, MAX_OUTPUT_CHARS);
+                    truncated = true;
+                }    
+            };
+            
+            const finish = (code: number | null): void => {
+                if (done)
+                    return;
+                done = true;
+                if (timer)
+                    clearTimeout(timer);
+                
+                const body = output.length > 0 && !output.endsWith("\n") ? output + "\n" : output;
+                const notes: string[] = [];
+                
+                if (timedOut)
+                    notes.push(`[timeout] 超过 ${timeoutMs}ms, 已结束进程树.`);
+                if (truncated)
+                    notes.push(`[truncated] 输出超过上限, 已截断`);
+                if (!timedOut && code !== 0)
+                    notes.push(`[exit ${code}] 命令失败`)
+                    
+                resolve(body + (notes.length > 0 ? notes.join("\n") : "[exit 0]"));
+            } 
+            
+            child.stdout?.on("data", append);
+            child.stderr?.on("data", append);
+            
+            timer = setTimeout(() => {
+                timedOut = true;
+                killTree(child.pid);
+                finish(null);
+            }, timeoutMs);
+            
+            child.on("error", (error) => {
+                if (done)
+                    return;
+                done = true;
+                if (timer)
+                    clearTimeout(timer);
+                resolve(formatError("bash", error.message, `检查 SHELL 是否能成功(当前: ${SHELL}), 或使用PI_SHELL指定.`));
+            })
+            
+            child.on("close", (code) => finish(code));
+        });
+    },
+};
+
 
 //工具在这里注册,不会再有第二个工具信息副本,方便维护
-export const TOOLS: Tool[] = [READ_TOOL, ECHO_TOOL, SLOW_TOOL, WRITE_TOOL, EDIT_TOOL];
+export const TOOLS: Tool[] = [READ_TOOL, ECHO_TOOL, SLOW_TOOL, WRITE_TOOL, EDIT_TOOL, BASH_TOOL];
 export const TOOL_DEFINITIONS: ToolDefinition[] = TOOLS.map((item) => (item.definition)); 
 
 
@@ -364,7 +520,7 @@ export async function runTool(name: string, rawArguments: string): Promise<strin
     }
     
     try {
-        return await withTimeout(tool.run(args), TOOL_TIMEOUT_MS);
+        return await withTimeout(tool.run(args), tool.timeoutMs ?? TOOL_TIMEOUT_MS);
     } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         return formatError(name, reason, hintFor(reason, tool.definition));
