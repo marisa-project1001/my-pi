@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { readFile, mkdir, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve, dirname, join } from "node:path";
 import type { ToolDefinition } from "./ai/types";
-import { existsSync } from "node:fs";
+import { existsSync, createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 
 export interface Tool {
     definition: ToolDefinition;
@@ -17,11 +17,15 @@ interface ObjectSchema {
     required?: string[];
 }
 
-const MAX_CHARS = 200000;// 给个上限防止撑爆上下文
+const MAX_READ_CHARS = 50000;// 给个上限防止撑爆上下文
+const MAX_READ_LINES = 2000;
 const TOOL_TIMEOUT_MS = Number(process.env.PI_TOOL_TIMEOUT_MS ?? 15000);//工具调用超时
 const MAX_WRITE_CHARS = 200000;/// 防止模型一次灌进超大内容
 const BASH_TIMEOUT_MS = Number(process.env.PI_BASH_TIMEOUT_MS ?? 30000);
 const MAX_OUTPUT_CHARS = 30000;
+const SPILL_DIR = join(".pi", "tool-output");//落盘位置
+
+await mkdir(join(process.cwd(), SPILL_DIR), {recursive: true});
 
 // 不要依赖 PATH 里的裸名字：Windows 上 `bash` 可能是 WSL 的应用执行别名，
 // 隐藏窗口里 spawn 会直接 EACCES（errno -4092），跟命令内容无关
@@ -76,6 +80,19 @@ function formatError(tool: string, reason: string, hint?: string): string {
     if (hint)
         lines.push(`hint: ${hint}`);
     return lines.join("\n");
+}
+
+//统一截断出口,将所有长输出都在这个函数过一遍
+function truncateWithNote(text: string, maxChars: number, more: string): string {
+    if (text.length <= maxChars)
+        return text;
+        
+    const cut = text.lastIndexOf("\n", maxChars);
+    const shown = text.slice(0, cut > 0 ? cut : maxChars);
+    const totalLines = text.split("\n").length;
+    const shownLines = shown.split("\n").length;
+    
+    return `${shown}\n[truncated] 只显示前 ${shown.length}/${text.length} 字符(${shownLines}/${totalLines} 行). ${more}`;
 }
 
 function exampleArgs(definition: ToolDefinition): string {
@@ -149,6 +166,8 @@ export const READ_TOOL: Tool = {
             type: "object",
             properties: {
                 path: { type: "string", description: "相对工作目录的文件路径,如 src/main.ts"},
+                offset: {type: "number", description: "从第几行开始读(从1数起),默认1;看到[truncated]时用它翻页"},
+                limit: {type: "number", description: `最多读多少行,默认 ${MAX_READ_LINES}`},
             },
             required: ["path"],
         }
@@ -163,12 +182,46 @@ export const READ_TOOL: Tool = {
         
         const full = insideWorkspace(path);
         const text = await readFile(full, "utf8");
+        const lines = text.split("\n");
         
-        if (text.length > MAX_CHARS) {
-            return text.slice(0, MAX_CHARS) + `\n...... (已截断, 原文共 ${text.length} 字符)`
+        const offset = Math.max(1, Math.floor(Number(args.offset ?? 1)) || 1);
+        const limit = args.limit === undefined ? MAX_READ_LINES : Math.max(1, Math.floor(Number(args.limit)) || MAX_READ_LINES);
+        
+        if (offset > lines.length) {
+            return `[提示] 文件共 ${lines.length} 行, offset ${offset} 超出范围.`;
         }
         
-        return text;
+        const startIndex = offset - 1;
+        const endIndex = Math.min(startIndex + limit, lines.length);
+        const picked: string[] = [];
+        let chars = 0;
+        
+        for (let i = startIndex; i < endIndex; i++) {
+            const cost = lines[i].length + 1;//+1是换行符
+            if (picked.length > 0 && chars + cost > MAX_READ_CHARS)
+                break;
+            picked.push(lines[i]);
+            chars += cost;
+        }
+        
+        if (picked.length === 1 && picked[0].length > MAX_READ_CHARS) {
+            const line = picked[0];
+            const more = lines.length > offset 
+                ? ` 下一行: read({"path":"${path}","offset":${offset + 1}})`
+                : "";
+            return line.slice(0, MAX_READ_CHARS) + `\n[truncated] 第 ${offset} 行本身有 ${line.length} 字符,只显示 ${MAX_READ_CHARS} 个. ${more}`;
+        }
+        
+        const shownEnd = startIndex + picked.length;
+        let body = picked.join("\n");
+        
+        if (shownEnd < lines.length) {
+            body += `\n[truncated] 文件共 ${lines.length} 行,本次显示第 ${offset}-${shownEnd} 行. 继续读:read("path":"${path}","offset":${shownEnd + 1})`;
+        } else if (offset > 1) {
+            body += `\n[info] 已显示到文件末尾(共 ${lines.length} 行).`;
+        }
+        
+        return body;
     },
 }
 
@@ -365,7 +418,9 @@ export const EDIT_TOOL: Tool = {
         const removed = needle.split("\n").length;
         const added = replacement.split("\n").length;
         
-        return `已编辑 ${path}: 第 ${lineNo} 行, - ${removed} 行 / + ${added} 行\n` + makeDiff(before, afterLf);
+        const summary = `已编辑 ${path}: 第 ${lineNo} 行, - ${removed} 行 / + ${added} 行\n`;
+        
+        return summary + truncateWithNote(makeDiff(before, afterLf), MAX_OUTPUT_CHARS, `用 read({"path":"${path}","offset":${Math.max(1, lineNo - 2)}}) 查看改动区域.`);
     }
 }
 
@@ -431,15 +486,37 @@ export const BASH_TOOL: Tool = {
             let timedOut = false;
             let done = false;
             let timer: ReturnType<typeof setTimeout> | undefined;
+            let totalBytes = 0;
+            let spill: WriteStream | null = null;
+            let spillFailed = false;
+            let spillPath = "";
+            let tailBuf = "";
             
             const append = (chunk: Buffer): void => {
-                if (truncated) 
+                if (done)
                     return;
+                    
+                totalBytes += chunk.length;
+                
+                if (spill) {
+                    spill.write(chunk);
+                    tailBuf = (tailBuf + chunk.toString("utf8")).slice(-4000);
+                    return;
+                }//已经确认spill了，数据文件    
+                
                 output += chunk.toString("utf8");
+                
                 if (output.length > MAX_OUTPUT_CHARS) {
+                    spillPath = join(SPILL_DIR, `bash-${Date.now()}.log`);
+                    spill = createWriteStream(spillPath);
+                    spill.write(output);
+                    spill.on("error", ()=> {
+                        spillFailed = true;
+                        spill = null;
+                    });
                     output = output.slice(0, MAX_OUTPUT_CHARS);
                     truncated = true;
-                }    
+                }
             };
             
             const finish = (code: number | null): void => {
@@ -449,18 +526,30 @@ export const BASH_TOOL: Tool = {
                 if (timer)
                     clearTimeout(timer);
                 
-                const body = output.length > 0 && !output.endsWith("\n") ? output + "\n" : output;
+                let body = output.length > 0 && !output.endsWith("\n") ? output + "\n" : output;
                 const notes: string[] = [];
                 
                 if (timedOut)
                     notes.push(`[timeout] 超过 ${timeoutMs}ms, 已结束进程树.`);
-                if (truncated)
-                    notes.push(`[truncated] 输出超过上限, 已截断`);
+                if (truncated) {
+                    const shownPath = spillPath.replaceAll("\\", "/");
+                    notes.push(`[truncated] 输出超过 ${MAX_OUTPUT_CHARS} 字符，完整内容已落盘：${shownPath}（用 read 分段查看，或 bash + grep 搜关键词）`);  notes.push(`......中间省略...(完整内容用read分段查看,或bash + grep 搜关键词)`);
+                      body = body + "\n" + tailBuf;               
+                }
+
                 if (!timedOut && code !== 0)
                     notes.push(`[exit ${code}] 命令失败`)
                     
-                resolve(body + (notes.length > 0 ? notes.join("\n") : "[exit 0]"));
+                const result = body + (notes.length > 0 ? notes.join("\n") : "[exit 0]");
+                
+                if (spill) {
+                    spill.end(() => resolve(result));
+                } else {
+                    resolve(result);
+                }
             } 
+            
+
             
             child.stdout?.on("data", append);
             child.stderr?.on("data", append);
