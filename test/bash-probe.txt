@@ -1,7 +1,0 @@
-bash tool probe record
-======================
-environment: spawn bash -> EACCES (shell binary not executable)
-variants tried: bash, sh -c
-result: all fail at spawn stage, before command runs
-write tool: OK (this file proves it)
-echo tool: OK
