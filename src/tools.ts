@@ -7,6 +7,7 @@ import { existsSync, createWriteStream, mkdirSync, type WriteStream } from "node
 export interface Tool {
     definition: ToolDefinition;
     timeoutMs?: number;
+    readOnly?: boolean;
     run: (args: Record<string, unknown>) => Promise<string>;
 }
 
@@ -172,6 +173,8 @@ export const READ_TOOL: Tool = {
             required: ["path"],
         }
     },
+
+    readOnly:true,
     
     async run(args) {
         const path = args.path;
@@ -237,6 +240,8 @@ export const ECHO_TOOL: Tool = {
             required: ["text"],
         },
     },
+
+    readOnly:true,
     
     async run(args) {
         const text = args.text;
@@ -258,6 +263,8 @@ export const SLOW_TOOL: Tool = {
             required: ["ms"],
         },
     },
+
+    readOnly:true,    
     
     async run(args) {
         const ms = Number(args.ms ?? 0);
@@ -279,6 +286,8 @@ export const WRITE_TOOL: Tool = {
             required: ["path","content"],
         },
     },
+
+    readOnly:false,
     
     async run(args) {
         const path = args.path;
@@ -371,6 +380,8 @@ export const EDIT_TOOL: Tool = {
             required: ["path", "oldText", "newText"],
         },
     },
+
+    readOnly: false,
     
     async run(args) {
         const path = args.path;
@@ -462,6 +473,7 @@ export const BASH_TOOL: Tool = {
     },
     
     timeoutMs: BASH_TIMEOUT_MS + 5000,
+    readOnly:false,
         
     async run(args) {
         const command = args.command;

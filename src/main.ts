@@ -4,7 +4,8 @@ import { chatOnce, ChatOptions, streamChat } from "./ai/openai";
 import {  createHistory } from "./messages";
 import * as readline from "node:readline/promises";
 import { ChatMessage, ChatToolCall, ToolDefinition } from "./ai/types";
-import { TOOL_DEFINITIONS, runTool } from "./tools";
+import { TOOL_DEFINITIONS } from "./tools";
+import { runToolCalls } from "./tool-runner";
 
 
 /*
@@ -244,10 +245,21 @@ async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted"
         // 要工具：assistant 带着 tool_calls 入账，再逐个执行
         ctx.history.push({role: "assistant", content: result.text, tool_calls: result.calls});
         
-        for (const call of result.calls) {
-            const output = await runTool(call.name, call.arguments);
-            console.log(`[tool] #${round} ${call.name}(${call.arguments}) -> ${preview(output)}`);
-            ctx.history.push({role: "tool", tool_call_id: call.id, content: output});
+        // 执行层负责并发与事件，这里只负责「怎么显示」
+        const results = await runToolCalls(result.calls, {
+            onEvent: (event) => {
+                if (event.type === "tool_start") {
+                    console.log(`[tool] #${round} ▶ ${event.name}(${preview(event.args)})`);
+                } else {
+                    const mark = event.ok ? "✓" : "✗";
+                    console.log(`[tool] #${round} ${mark} ${event.name} ${event.ms}ms ${event.chars}字符 -> ${preview(event.output)}`);
+                }
+            },
+        });
+
+        // 按调用顺序回灌，而不是按完成顺序：结果数组由执行层保证顺序
+        for (const item of results) {
+            ctx.history.push({role: "tool", tool_call_id: item.call.id, content: item.output});
         }
     } 
     
