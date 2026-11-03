@@ -19,9 +19,11 @@ export interface ToolCallResult {
 export interface RunToolCallsOptions {
     onEvent?: (event: ToolEvent) => void;
     concurrency?: number;
+    signal?: AbortSignal;
 }
 
 const DEFAULT_CONCURRENCY = 4;
+const ABORTED_SKIP = "[aborted] 用户取消,工具未执行.";
 //只读工具才能并行
 function isReadOnly(name: string): boolean {
     return TOOLS.find((item) => item.definition.name === name)?.readOnly === true;
@@ -48,13 +50,21 @@ async function runBatch(
                 return;
 
             const call = batch[index];
+
+            if (options.signal?.aborted) {
+                results[offset + index] = { call, output: ABORTED_SKIP, ok: false, ms: 0 };
+                continue;
+            }
+
+
+
             const startedAt = Date.now();
 
             options.onEvent?.({ type: "tool_start", id: call.id, name: call.name, args: call.arguments });
 
-            const output = await runTool(call.name, call.arguments);
+            const output = await runTool(call.name, call.arguments, options.signal);
             const ms = Date.now() - startedAt;
-            const ok = succeed(output);
+            const ok = !options.signal?.aborted && succeed(output);
 
             options.onEvent?.({ type: "tool_end", id: call.id, name: call.name, ok, ms, chars: output.length, output });
             results[offset + index] = { call, output, ok, ms };

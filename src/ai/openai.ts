@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatResult, ChatStreamEvent, ChatToolCall, ToolDefinition,  } from "./types";
+import type { ChatMessage, ChatResult, ChatStreamEvent, ChatToolCall, ToolDefinition, ChatStopReason } from "./types";
 
 /*
 ChatOptions包含对话信息,会在每轮对话时传入Chat函数
@@ -186,6 +186,7 @@ interface StreamDelta {
 interface OpenAIStreamResponse {
     choices?: Array<{
         delta?: StreamDelta;
+        finish_reason?: string | null;
     }>;
 }//流式响应类型
 
@@ -206,9 +207,9 @@ function readSseData(rawEvent: string): string | null {
 }
 
 /*
-从data中解析出Delta
+从data中解析出Delta和finish_reason
 */
-function parseDelta(data: string): StreamDelta {
+function parseChunk(data: string): { delta: StreamDelta; finishReason: string | null} {
     let parsed: unknown;
     
     try {
@@ -216,9 +217,35 @@ function parseDelta(data: string): StreamDelta {
     } catch {
         throw new ChatError(`Invalid SSE JSON: ${data.slice(0,200)}`);
     }
-    
-    return (parsed as OpenAIStreamResponse).choices?.[0]?.delta ?? {};
+
+    const choice = (parsed as OpenAIStreamResponse).choices?.[0];
+
+    return {
+        delta: choice?.delta ?? {},
+        finishReason: choice?.finish_reason ?? null,
+    };
 }
+
+/*
+    把provider的原始finish_reason 翻译成我们自己的结束原因
+*/
+
+function toStopReason(raw: string | null, hasToolCalls: boolean): ChatStopReason {
+    switch (raw) {
+        case "stop":
+            return "stop";
+        case "length":
+            return "length";
+        case "tool_calls":
+        case "function_call":
+            return "toolUse";
+        case "content_filter":
+            return "contentFilter";
+        default:
+            return hasToolCalls ? "toolUse" : "stop";
+    }
+}
+
 
 /*
 将Delta拼在对于id的ToolCall上,由于一轮对话text流只有一个,所以不需要根据id分配
@@ -305,6 +332,7 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
     let buffer = "";
     let fullText = "";
     let finished = false;
+    let finishReason: string | null = null;
     
     const pendingCalls = new Map<number, { id: string; name: string; args: string;}>();
     
@@ -334,7 +362,9 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
                     break;
                 }
                 
-               const text = applyDelta(parseDelta(data), pendingCalls);
+                const chunk = parseChunk(data);
+                finishReason = chunk.finishReason ?? finishReason;
+                const text = applyDelta(chunk.delta, pendingCalls);
                 
                 if(text.length > 0) {
                     fullText += text;
@@ -349,7 +379,9 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
             const data = readSseData(buffer);
             
             if(data && data !== "[DONE]") {
-                const text = applyDelta(parseDelta(data), pendingCalls);
+                const chunk = parseChunk(data);
+                finishReason = chunk.finishReason ?? finishReason;
+                const text = applyDelta(chunk.delta, pendingCalls);
                 
                 if (text.length > 0) {
                     fullText += text;
@@ -357,9 +389,18 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
                 }
             }
         }
+
+        if (options.signal?.aborted) {
+            yield { type: "aborted", partialText: fullText };
+            return;
+        }
+
+        const hasCalls = pendingCalls.size > 0;
+        const stopReason = toStopReason(finishReason, hasCalls);
+
         
         //工具调用type返回
-        if (pendingCalls.size > 0) {
+        if (hasCalls) {
             const calls: ChatToolCall[] = [...pendingCalls.entries()]
             .sort((a, b) => a[0] - b[0])//按工具调用的index排序
             .map(([index, slot]) => ({
@@ -367,17 +408,13 @@ export async function* streamChat(options: ChatOptions): AsyncGenerator<ChatStre
                 name: slot.name,
                 arguments: slot.args,
             }));
+
+            const truncated = stopReason === "length" || stopReason === "contentFilter";
     
-            yield { type: "tool_calls", calls };
+            yield { type: "tool_calls", calls, truncated };
         }
-        
-        if (options.signal?.aborted) {
-            yield { type: "aborted", partialText: fullText };
-            return;
-        }
-        
-        
-        yield {type:"done",text:fullText};
+                
+        yield {type:"done",text:fullText, stopReason};
     } catch(error) {
       if (options.signal?.aborted) {
               yield {type: "aborted", partialText: fullText};

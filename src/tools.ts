@@ -8,7 +8,7 @@ export interface Tool {
     definition: ToolDefinition;
     timeoutMs?: number;
     readOnly?: boolean;
-    run: (args: Record<string, unknown>) => Promise<string>;
+    run: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<string>;
 }
 
 interface SchemaProperty { type?: string; description?: string;}
@@ -266,9 +266,25 @@ export const SLOW_TOOL: Tool = {
 
     readOnly:true,    
     
-    async run(args) {
+    async run(args, signal) {
         const ms = Number(args.ms ?? 0);
-        await new Promise((done) => setTimeout(done, ms));
+        if (signal?.aborted)
+            throw new Error("aborted");
+
+        await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                signal?.removeEventListener("abort", onAbort);
+                resolve();
+            }, ms);
+
+            const onAbort = () => {
+                clearTimeout(timer);
+                reject(new Error("aborted"));
+            }
+
+            signal?.addEventListener("abort", onAbort, { once: true });
+
+        });
         return `睡了 ${ms}ms`;
     },
 }
@@ -436,17 +452,40 @@ export const EDIT_TOOL: Tool = {
 }
 
 //递归删除进程树
-function killTree(pid: number | undefined): void {
+function killTree(pid: number | undefined, tag?: string): void {
     if(!pid)
         return;
         
     if (process.platform === "win32") {
+        if (tag && /bash/i.test(SHELL)) {
+            const script = [
+                `tag='${tag}'`,
+                "for d in /proc/[0-9]*; do",
+                ' if tr "\\0" "\\n" < "$d/environ" 2>/dev/null | grep -qx "PI_TOOL_TAG=$tag"; then',
+                '   kill -9 "$(basename "$d")" 2>/dev/null',
+                " fi",
+                "done",
+            ].join("\n");
+
+            const taggedKiller = spawn(SHELL, ["-c", script], {
+                windowsHide: true,
+                stdio: "ignore",
+                detached: true,
+                env: { ...process.env, PI_TOOL_TAG: "" },
+            })
+
+            taggedKiller.on("error", () => { });
+            taggedKiller.unref();
+            return;
+        }
+
         const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
             windowsHide: true,
             stdio: "ignore",
             detached: true,
         });
-        killer.on("error", () => {});
+
+        killer.on("error", () => { });
         killer.unref();
         return;
     }
@@ -475,15 +514,18 @@ export const BASH_TOOL: Tool = {
     timeoutMs: BASH_TIMEOUT_MS + 5000,
     readOnly:false,
         
-    async run(args) {
+    async run(args, signal) {
         const command = args.command;
         
         if (typeof command !== "string" || command.trim().length === 0) {
             throw new Error("缺少参数 command");
         }
+
+        if (signal?.aborted)
+            return "[aborted] 用户取消,命令未执行";
         
         const timeoutMs = Math.min(Number(args.timeoutMs ?? BASH_TIMEOUT_MS), 120000);
-        
+        const tag = `pi-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; 
         
         return await new Promise<string>((resolve) => {
             const child = spawn(command, {
@@ -491,11 +533,13 @@ export const BASH_TOOL: Tool = {
                 cwd: process.cwd(),
                 windowsHide: true,
                 detached: process.platform !== "win32", // POSIX 下按进程组杀
+                env: {...process.env, PI_TOOL_TAG: tag },
             });
             
             let output = "";
             let truncated = false;
             let timedOut = false;
+            let aborted = false;
             let done = false;
             let timer: ReturnType<typeof setTimeout> | undefined;
             let totalBytes = 0;
@@ -535,21 +579,26 @@ export const BASH_TOOL: Tool = {
                 if (done)
                     return;
                 done = true;
+                signal?.removeEventListener("abort", onAbort);
                 if (timer)
                     clearTimeout(timer);
                 
                 let body = output.length > 0 && !output.endsWith("\n") ? output + "\n" : output;
                 const notes: string[] = [];
                 
+                if (aborted)
+                    notes.push(`[aborted] 用户取消,已结束进程树.`);
+
                 if (timedOut)
                     notes.push(`[timeout] 超过 ${timeoutMs}ms, 已结束进程树.`);
                 if (truncated) {
                     const shownPath = spillPath.replaceAll("\\", "/");
-                    notes.push(`[truncated] 输出超过 ${MAX_OUTPUT_CHARS} 字符，完整内容已落盘：${shownPath}（用 read 分段查看，或 bash + grep 搜关键词）`);  notes.push(`......中间省略...(完整内容用read分段查看,或bash + grep 搜关键词)`);
-                      body = body + "\n" + tailBuf;               
+                    notes.push(`[truncated] 输出超过 ${MAX_OUTPUT_CHARS} 字符，完整内容已落盘：${shownPath}（用 read 分段查看，或 bash + grep 搜关键词）`);
+                    notes.push(`......中间省略...(完整内容用read分段查看,或bash + grep 搜关键词)`);
+                    body = body + "\n" + tailBuf;               
                 }
 
-                if (!timedOut && code !== 0)
+                if (!timedOut && !aborted && code !== 0)
                     notes.push(`[exit ${code}] 命令失败`)
                     
                 const result = body + (notes.length > 0 ? notes.join("\n") : "[exit 0]");
@@ -561,14 +610,23 @@ export const BASH_TOOL: Tool = {
                 }
             } 
             
-
+            const onAbort = (): void => {
+                if (done)
+                    return;
+                aborted = true;
+                try { child.kill(); } catch { };
+                killTree(child.pid, tag);
+                finish(null);
+            }
+            signal?.addEventListener("abort", onAbort, { once: true });
             
             child.stdout?.on("data", append);
             child.stderr?.on("data", append);
             
             timer = setTimeout(() => {
                 timedOut = true;
-                killTree(child.pid);
+                try { child.kill(); } catch { };
+                killTree(child.pid, tag);
                 finish(null);
             }, timeoutMs);
             
@@ -576,6 +634,7 @@ export const BASH_TOOL: Tool = {
                 if (done)
                     return;
                 done = true;
+                signal?.removeEventListener("abort", onAbort);
                 if (timer)
                     clearTimeout(timer);
                 resolve(formatError("bash", error.message, `检查 SHELL 是否能成功(当前: ${SHELL}), 或使用PI_SHELL指定.`));
@@ -595,7 +654,10 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = TOOLS.map((item) => (item.defi
 /*
 执行工具调用永远返回字符串,直接输回模型
 */
-export async function runTool(name: string, rawArguments: string): Promise<string> {
+export async function runTool(name: string, rawArguments: string, signal?: AbortSignal): Promise<string> {
+    if (signal?.aborted)
+        return `[aborted] ${name} 未执行:用户已取消`;
+
     const tool = TOOLS.find((item) => item.definition.name === name);
     
     if(!tool)
@@ -621,8 +683,11 @@ export async function runTool(name: string, rawArguments: string): Promise<strin
     }
     
     try {
-        return await withTimeout(tool.run(args), tool.timeoutMs ?? TOOL_TIMEOUT_MS);
+        return await withTimeout(tool.run(args, signal), tool.timeoutMs ?? TOOL_TIMEOUT_MS);
     } catch (error) {
+        if (signal?.aborted)
+            return `[aborted] ${name} 被用户取消。`;
+
         const reason = error instanceof Error ? error.message : String(error);
         return formatError(name, reason, hintFor(reason, tool.definition));
     }

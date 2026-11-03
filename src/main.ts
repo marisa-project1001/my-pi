@@ -3,7 +3,7 @@ import { AppConfig, loadConfig } from "./config";
 import { chatOnce, ChatOptions, streamChat } from "./ai/openai";
 import {  createHistory } from "./messages";
 import * as readline from "node:readline/promises";
-import { ChatMessage, ChatToolCall, ToolDefinition } from "./ai/types";
+import { ChatMessage, ChatStopReason, ChatToolCall, ToolDefinition } from "./ai/types";
 import { TOOL_DEFINITIONS } from "./tools";
 import { runToolCalls } from "./tool-runner";
 
@@ -145,61 +145,56 @@ const commands = new Map<string,ReplCommand>([
 interface TurnResult {
     text: string;
     calls: ChatToolCall[];
-    aborted: boolean;
-    error: boolean;
+    stopReason: ChatStopReason;
+    truncated: boolean;
 }
 
 //单次请求
-async function requestOnce(ctx: RunContext): Promise<TurnResult> {
-    const controller = new AbortController();
-    currentController = controller;
-    
-    try {
-        const chatOptions: ChatOptions = {
-              apiKey: ctx.config.apiKey,
-              baseUrl: ctx.config.baseUrl,
-              model: ctx.config.model,  
-              messages: [...ctx.history],
-              tools: ctx.tools,
-              signal: controller.signal,
-        };
-    
-        let text = "";
-        let calls: ChatToolCall[] = [];
-        let aborted = false;
-        let error = false;
-        
-        for await (const event of streamChat(chatOptions)) {
-            if (event.type === "text") {
-                process.stdout.write(event.delta);
-            } else if (event.type === "done") {
-                text = event.text;
-                process.stdout.write("\n");
-            } else if (event.type === "tool_calls") {
-                calls = event.calls;
-            } else if (event.type === "aborted") {
-                aborted = true;
-                
-                if(event.partialText.length > 0) {
-                    process.stderr.write("\n");
-                }
-                
-                process.stderr.write("Aborted.\n");
-            } else {
-                error = true;
-                
-                if (event.partialText.length > 0) {
-                    process.stderr.write("\n");
-                }
-                
-                process.stderr.write(`Error: ${event.message}\n`);
-            }
-        }
+async function requestOnce(ctx: RunContext, signal: AbortSignal): Promise<TurnResult> {
+    const chatOptions: ChatOptions = {
+            apiKey: ctx.config.apiKey,
+            baseUrl: ctx.config.baseUrl,
+            model: ctx.config.model,  
+            messages: [...ctx.history],
+            tools: ctx.tools,
+            signal,
+    };
 
-        return {text, calls, aborted, error };
-    } finally {
-        currentController = null;
+    let text = "";
+    let calls: ChatToolCall[] = [];
+    let stopReason: ChatStopReason = "stop";
+    let truncated = false;
+    
+    for await (const event of streamChat(chatOptions)) {
+        if (event.type === "text") {
+            process.stdout.write(event.delta);
+        } else if (event.type === "done") {
+            text = event.text;
+            stopReason = event.stopReason;
+            process.stdout.write("\n");
+        } else if (event.type === "tool_calls") {
+            calls = event.calls;
+            truncated = event.truncated;
+        } else if (event.type === "aborted") {
+            stopReason = "aborted";
+            
+            if(event.partialText.length > 0) {
+                process.stderr.write("\n");
+            }
+            
+            process.stderr.write("Aborted.\n");
+        } else {
+            stopReason = "error";
+            
+            if (event.partialText.length > 0) {
+                process.stderr.write("\n");
+            }
+            
+            process.stderr.write(`Error: ${event.message}\n`);
+        }
     }
+
+    return {text, calls, stopReason, truncated };
 }
 
 function preview(text: string): string {
@@ -209,7 +204,30 @@ function preview(text: string): string {
 
 //单轮流式对话
 const MAX_TOOL_ROUNDS = 8;//一轮最多8次工具循环
-async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted" | "error"> {
+
+type TurnOutcome = "ok" | "aborted" | "error" | "length" | "contentFilter" | "maxRounds";
+
+function reportStop(reason: ChatStopReason): void {
+    if (reason === "length") {
+        process.stderr.write("[stop] 输出达到长度上限(length), 回答被截断. \n");
+    } else if (reason === "contentFilter") {
+        process.stderr.write("[stop] 内容被安全策略拦截(content_filter). \n");
+    }
+}
+
+async function runTurn(ctx: RunContext, input: string): Promise<TurnOutcome> {
+    const controller = new AbortController();
+    currentController = controller;
+
+    try {
+        return await runTurnLoop(ctx, input, controller.signal);
+    } finally {
+        if (currentController === controller)
+            currentController = null;
+    }
+}
+
+async function runTurnLoop(ctx: RunContext, input: string, signal:AbortSignal): Promise<TurnOutcome> {
     const turnStart = ctx.history.length;
     
     ctx.history.push({role: "user", content: input});
@@ -219,9 +237,9 @@ async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted"
     }
     
     for (let round = 1; round <= MAX_TOOL_ROUNDS ; round++ ) {
-        const result = await requestOnce(ctx);
+        const result = await requestOnce(ctx, signal);
         
-        if (result.aborted) {
+        if (result.stopReason === "aborted") {
             // 这一轮还没产生任何工具结果：撤干净；已经做过事：保留事实
             if (ctx.history.length === turnStart + 1) {
                 ctx.history.length = turnStart;//截断
@@ -229,16 +247,35 @@ async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted"
             return "aborted";
         }
         
-        if (result.error) {
+        if (result.stopReason === "error") {
             if (ctx.history.length === turnStart + 1) {
                 ctx.history.length = turnStart;//截断
             }
             return "error";
         }
+
+        if (result.truncated) {
+            ctx.history.push({ role: "assistant", content: result.text });
+            process.stderr.write(`[stop] 工具调用不完整(stopReason=${result.stopReason}),已拒绝执行\n`);
+            return result.stopReason === "contentFilter" ? "contentFilter" : "length";
+        }
+
+
         
         // 模型不再要工具：这一轮结束
         if (result.calls.length === 0) {
-            ctx.history.push({role: "assistant", content:result.text});
+            ctx.history.push({ role: "assistant", content: result.text });
+            
+            if (result.stopReason === "toolUse") {
+                process.stderr.write("[stop] 模型表示要调用工具,但没有解析到完整调用.\n");
+                return "error";
+            }
+
+            reportStop(result.stopReason);
+
+            if (result.stopReason === "length" || result.stopReason === "contentFilter")
+                return result.stopReason;
+
             return "ok";
         }
         
@@ -247,6 +284,7 @@ async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted"
         
         // 执行层负责并发与事件，这里只负责「怎么显示」
         const results = await runToolCalls(result.calls, {
+            signal,
             onEvent: (event) => {
                 if (event.type === "tool_start") {
                     console.log(`[tool] #${round} ▶ ${event.name}(${preview(event.args)})`);
@@ -261,10 +299,13 @@ async function runTurn(ctx: RunContext, input: string): Promise<"ok" | "aborted"
         for (const item of results) {
             ctx.history.push({role: "tool", tool_call_id: item.call.id, content: item.output});
         }
+
+        if (signal.aborted)
+            return "aborted";
     } 
     
-    console.log(`[tool] 连续 ${MAX_TOOL_ROUNDS} 轮都在请求工具，已停止。可以继续追问，或 /clear 重开。`);
-    return "ok";
+    process.stderr.write(`[stop] 连续 ${MAX_TOOL_ROUNDS} 轮工具调用，达到上限。\n`);
+    return "maxRounds";
 }
 
 //单次非流式
@@ -398,7 +439,7 @@ async function main(): Promise<void> {
         
         if (outcome === "aborted") {
             process.exitCode = 130;
-        } else if (outcome === "error") {
+        } else if (outcome === "error" || outcome === "length" || outcome === "contentFilter" || outcome === "maxRounds") {
             process.exitCode = 1;
         }
         
